@@ -21,9 +21,8 @@ def discount_cumsum(x, discount):
     Input: [x0, x1, ..., xn]
     Output: [x0 + discount * x1 + discount^2 * x2, x1 + discount * x2, ..., xn]
     """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
-    exp_vals = torch.pow(torch.arange(1, x.size(dim=0)+1), discount)
-    return torch.cumsum(exp_vals * x, dim=0)
 
 def combined_shape(length, shape=None):
     """Helper function that combines two array shapes."""
@@ -79,8 +78,6 @@ class Actor(nn.Module):
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
         super().__init__()
         self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
-
-
 
     def _distribution(self, obs):
         """
@@ -193,18 +190,18 @@ class VPGBuffer:
     Buffer to store trajectories.
     """
     def __init__(self, obs_dim, act_dim, size, gamma, lam):
-        self.obs_buf = torch.zeros(combined_shape(size, obs_dim), dtype=torch.float32)
-        self.act_buf =  torch.zeros(combined_shape(size, obs_dim), dtype=torch.float32)
+        self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
         # calculated TD residuals
-        self.tdres_buf = torch.zeros(size, dtype=torch.float32)
+        self.tdres_buf = np.zeros(size, dtype=np.float32)
         # rewards
-        self.rew_buf = torch.zeros(size, dtype=torch.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
         # trajectory's remaining return
-        self.ret_buf = torch.zeros(size, dtype=torch.float32)
+        self.ret_buf = np.zeros(size, dtype=np.float32)
         # values predicted
-        self.val_buf = torch.zeros(size, dtype=torch.float32)
+        self.val_buf = np.zeros(size, dtype=np.float32)
         # log probabilities of chosen actions under behavior policy
-        self.logp_buf = torch.zeros(size, dtype=torch.float32)
+        self.logp_buf = np.zeros(size, dtype=np.float32)
         self.gamma = gamma
         self.lam = lam
         # Pointer to the latest data point in the buffer.
@@ -276,21 +273,24 @@ class VPGBuffer:
         path_slice = slice(self.path_start_idx, self.ptr)
     
     
-        rews = torch.cat((self.rew_buf[path_slice], last_val), 0)
-        vals = torch.cat((self.val_buf[path_slice], last_val), 0)
+        rews = np.append(self.rew_buf[path_slice], last_val)
+        vals = np.append(self.val_buf[path_slice], last_val)
+
+
+        self.ret_buf[self.ptr:self.path_start_idx] = (
+            np.cumsum(self.rew_buf[self.ptr:self.path_start_idx][::-1])[::-1]
+        )
 
         # TODO: Implement TD residuals calculation.
         # Hint: use the discount_cumsum function 
-        # compute td residuals
         tdres = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
         self.tdres_buf[path_slice] = tdres
 
-        #print(self.tdres_buf)
+
 
         # TODO: Implement discounted rewards-to-go calculation. 
         # Hint: use the discount_cumsum function 
-        # compute GAE as papaer
-        self.ret_buf[path_slice] = discount_cumsum(self.rew_buf[path_slice], self.gamma)
+        self.ret_buf[path_slice] = discount_cumsum(self.rew_buf[path_slice], self.gamma) 
 
         # Update the path_start_idx
         self.path_start_idx = self.ptr
@@ -307,8 +307,8 @@ class VPGBuffer:
         self.ptr, self.path_start_idx = 0, 0
 
         #self.tdres_buf = self.tdres_buf
-        tdres_mean = torch.mean(self.tdres_buf)
-        tdres_std = torch.std(self.tdres_buf)
+        tdres_mean = np.mean(self.tdres_buf)
+        tdres_std = np.std(self.tdres_buf)
         self.tdres_buf = (self.tdres_buf - tdres_mean) / tdres_std
 
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
@@ -349,15 +349,15 @@ class Agent:
         # TODO: Implement this function.
         # Hint: This function is only called during inference. You should use
         # `torch.no_grad` to ensure that it does not interfer with the gradient computation.
-        #with torch.no_grad():
-        # compute distribution
-        pi = self.actor._distribution(state)
-        # sample action
-        act = pi.sample()
-        # compute log_prob
-        log_prob = self.actor._log_prob_from_distribution(pi, act)
-        # compute value
-        v = self.critic(state)
+        with torch.no_grad():
+            # compute distribution
+            pi = self.actor._distribution(state)
+            # sample action
+            act = pi.sample()
+            # compute log_prob
+            log_prob = self.actor._log_prob_from_distribution(pi, act)
+            # compute value
+            v = self.critic(state)
 
         return act, v, log_prob
 
@@ -463,10 +463,8 @@ def train(env, seed=0):
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if epoch_ended:
                     _, v, _ = agent.step(torch.as_tensor(state, dtype=torch.float32))
-                    v = v.unsqueeze(0)
-                    #print(v.size)
                 else:
-                    v = torch.tensor([0])
+                    v = 0
                 if timeout or terminal:
                     ep_returns.append(ep_ret)  # only store return when episode ended
                     
@@ -484,26 +482,29 @@ def train(env, seed=0):
         # done for you.
 
         data = buf.get()
-        
+       
         # Do 1 policy gradient update
         actor_optimizer.zero_grad() #reset the gradient in the actor optimizer
 
         #Hint: you need to compute a 'loss' such that its derivative with respect to the actor
         # parameters is the policy gradient. Then call loss.backwards() and actor_optimizer.step()
-        loss_actor = - (data["logp"] * data["ret"]).sum()
-        loss_actor.backward(retain_graph=True)
-        #print(loss_actor)
+        _, logp = agent.actor(data["obs"], data["act"])
+        loss_actor =  - (logp * data["tdres"]).sum()
+        loss_actor.backward()
         actor_optimizer.step()
-
+        
         # We suggest to do 100 iterations of value function updates
         
-        for _ in range(1):
+        for _ in range(100):
             #compute a loss for the value function, call loss.backwards() and then
             #critic_optimizer.step()
             critic_optimizer.zero_grad()
-            loss_critic = (data["tdres"]**2).sum()
-            print(loss_critic)
-            loss_critic.backward(retain_graph=True)
+            # compute values
+            vals = agent.critic(data["obs"])
+            # compute tdres
+            loss_critic = nn.MSELoss()(vals, data["ret"])
+            #print(loss_critic)
+            loss_critic.backward()
             critic_optimizer.step()
 
     return agent
