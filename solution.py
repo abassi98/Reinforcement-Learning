@@ -277,10 +277,6 @@ class VPGBuffer:
         vals = np.append(self.val_buf[path_slice], last_val)
 
 
-        self.ret_buf[self.ptr:self.path_start_idx] = (
-            np.cumsum(self.rew_buf[self.ptr:self.path_start_idx][::-1])[::-1]
-        )
-
         # TODO: Implement TD residuals calculation.
         # Hint: use the discount_cumsum function 
         tdres = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
